@@ -1,0 +1,36 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net48</TargetFramework>
+    <AssemblyName>SimSetups.TelemetryPlugin</AssemblyName>
+    <RootNamespace>SimSetups</RootNamespace>
+    <LangVersion>latest</LangVersion>
+    <Deterministic>true</Deterministic>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <CopyLocalLockFileAssemblies>false</CopyLocalLockFileAssemblies>
+    <NoWarn>CS0108;CS0114;CS0414;CS0649</NoWarn>
+    <Version>2.5.0</Version>
+    <AssemblyVersion>2.5.0.0</AssemblyVersion>
+    <FileVersion>2.5.0.0</FileVersion>
+  </PropertyGroup>
+
+  <!-- Referências às DLLs REAIS do SimHub instaladas localmente em lib/.
+       Forma mais robusta de compilar: usa as mesmas DLLs que o usuário tem
+       em runtime, evitando type mismatch que era o bug das v2.4.1/2.4.2 do Lovable
+       (que usavam Stub.cs com tipos inventados). -->
+  <ItemGroup>
+    <Reference Include="SimHub.Plugins">
+      <HintPath>lib\SimHub_Plugins.dll</HintPath>
+      <Private>false</Private>
+      <SpecificVersion>false</SpecificVersion>
+    </Reference>
+    <Reference Include="GameReaderCommon">
+      <HintPath>lib\GameReaderCommon.dll</HintPath>
+      <Private>false</Private>
+      <SpecificVersion>false</SpecificVersion>
+    </Reference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <Compile Include="src\**\*.cs" />
+  </ItemGroup>
+</Project>
