@@ -1,0 +1,19 @@
+# Build outputs
+bin/
+obj/
+build-output/
+*.user
+*.suo
+*.cache
+
+# IDE
+.vs/
+.idea/
+*.swp
+.DS_Store
+
+# Logs locais
+*.log
+
+# Token (não commitar token de teste!)
+SimSetups_Token.txt
