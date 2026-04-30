@@ -32,7 +32,7 @@ jobs:
         run: dotnet restore SimSetups.TelemetryPlugin.csproj
 
       - name: Build (Release)
-        run: dotnet build SimSetups.TelemetryPlugin.csproj --configuration Release --no-restore -p:Version=2.5.1
+        run: dotnet build SimSetups.TelemetryPlugin.csproj --configuration Release --no-restore -p:Version=2.5.2
 
       - name: Locate built DLL
         id: locate
@@ -54,6 +54,6 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: SimSetups_TelemetryPlugin-v2.5.1
+          name: SimSetups_TelemetryPlugin-v2.5.2
           path: build-output/SimSetups_TelemetryPlugin.dll
           if-no-files-found: error
