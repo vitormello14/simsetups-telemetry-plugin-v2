@@ -29,8 +29,4 @@
       <SpecificVersion>false</SpecificVersion>
     </Reference>
   </ItemGroup>
-
-  <ItemGroup>
-    <Compile Include="src\**\*.cs" />
-  </ItemGroup>
 </Project>
