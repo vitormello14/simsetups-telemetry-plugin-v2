@@ -8,9 +8,9 @@
     <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
     <CopyLocalLockFileAssemblies>false</CopyLocalLockFileAssemblies>
     <NoWarn>CS0108;CS0114;CS0414;CS0649</NoWarn>
-    <Version>2.5.1</Version>
-    <AssemblyVersion>2.5.1.0</AssemblyVersion>
-    <FileVersion>2.5.1.0</FileVersion>
+    <Version>2.5.2</Version>
+    <AssemblyVersion>2.5.2.0</AssemblyVersion>
+    <FileVersion>2.5.2.0</FileVersion>
   </PropertyGroup>
 
   <!-- Referências às DLLs REAIS do SimHub instaladas localmente em lib/.
@@ -28,5 +28,9 @@
       <Private>false</Private>
       <SpecificVersion>false</SpecificVersion>
     </Reference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <Compile Include="src\**\*.cs" />
   </ItemGroup>
 </Project>
