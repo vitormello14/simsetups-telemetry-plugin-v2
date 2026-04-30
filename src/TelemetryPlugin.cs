@@ -12,12 +12,12 @@ using SimHub.Plugins;
 
 namespace SimSetups
 {
-    [PluginDescription("Sim Setups Telemetry Plugin (v2.5.2 com diagnostico amplo)")]
+    [PluginDescription("Sim Setups Telemetry Plugin (v2.5.3 fix definitivo - fallback LastLapTime)")]
     [PluginAuthor("SimSetups")]
     [PluginName("Sim Setups Telemetry")]
     public class TelemetryPlugin : IPlugin, IDataPlugin
     {
-        private const string VERSION = "2.5.2";
+        private const string VERSION = "2.5.3";
         private const int TRACE_HZ = 10;
 
         // ============================================================
@@ -29,6 +29,7 @@ namespace SimSetups
         private const bool FIX_STRICT_OPPONENT      = true;  // online: exige playerOpp e nao "conserta" lap_time
         private const bool FIX_LAP_JUMP_GUARD       = true;  // descarta saltos > 1 em CompletedLaps
         private const bool FIX_SETTLE_WINDOW        = true;  // espera 200ms apos detectar volta nova
+        private const bool FIX_LASTLAPTIME_FALLBACK = true;  // v2.5.3: detecta volta quando LastLapTime muda mas CompletedLaps trava
         private const int  SETTLE_WINDOW_MS         = 200;
 
         private string _apiToken;
@@ -75,6 +76,23 @@ namespace SimSetups
         //  2. validar contra o playerOpp.LastLapTime atualizado
         private int _pendingLapNumber = -1;
         private DateTime _pendingLapDetectedAt = DateTime.MinValue;
+
+        // ============================================================
+        // v2.5.3 FIX 5 — FALLBACK PARA ULTIMA VOLTA DE CORRIDA PLANEJADA
+        // ============================================================
+        // Bug descoberto via log v2.5.2: na ULTIMA volta de uma corrida planejada
+        // do F1 25, o jogo trava CompletedLaps em N-1 e atualiza apenas LastLapTime
+        // para o tempo da volta finalizada. O detector tradicional (que exige
+        // CompletedLaps > _lastSentLapNumber) nao dispara.
+        //
+        // Este fallback detecta o cenario: LastLapTime mudou para valor novo valido
+        // E CompletedLaps continua igual a _lastSentLapNumber. Trata como volta
+        // _lastSentLapNumber + 1.
+        //
+        // Esse era o bug historico que assombrava o projeto desde a v2.4.0.
+        // ============================================================
+        private double _lastSentLapTime = 0.0;        // tempo (s) da volta enviada por ultimo
+        private double _lastFallbackTriedTime = 0.0;  // ultimo LastLapTime que tentamos fallback (evita re-trigger)
 
         // ============================================================
         // v2.5.2 — campos de diagnostico amplo
@@ -468,6 +486,32 @@ namespace SimSetups
                 }
 
                 // ============================================================
+                // v2.5.3 FIX 5 — FALLBACK: LastLapTime mudou mas CompletedLaps travou
+                // Cenario classico do F1 25 ULTIMA volta de corrida planejada.
+                // ============================================================
+                bool fallbackTrigger = false;
+                int targetLapNumber = newData.CompletedLaps;  // padrao: usa CompletedLaps
+                double curLastLapTimeSec = newData.LastLapTime.TotalSeconds;
+
+                if (FIX_LASTLAPTIME_FALLBACK &&
+                    !suspiciousJump &&
+                    _lastSentLapNumber > 0 &&                                          // ja enviou pelo menos 1 volta
+                    curLastLapTimeSec > 5.0 &&                                         // LastLapTime valido
+                    Math.Abs(curLastLapTimeSec - _lastSentLapTime) > 0.05 &&           // != da ultima enviada (>50ms)
+                    Math.Abs(curLastLapTimeSec - _lastFallbackTriedTime) > 0.05 &&     // ainda nao tentamos fallback pra esse valor
+                    newData.CompletedLaps == _lastSentLapNumber)                       // CompletedLaps NAO incrementou
+                {
+                    targetLapNumber = _lastSentLapNumber + 1;
+                    fallbackTrigger = true;
+                    _lastFallbackTriedTime = curLastLapTimeSec;
+                    Log("FALLBACK LASTLAP TRIGGER: completedLaps=" + newData.CompletedLaps +
+                        " (travado em _lastSent=" + _lastSentLapNumber + ")" +
+                        " lastLapTime mudou de " + _lastSentLapTime.ToString("F3") +
+                        " para " + curLastLapTimeSec.ToString("F3") +
+                        " - tratando como volta " + targetLapNumber);
+                }
+
+                // ============================================================
                 // v2.5.0 FIX 4 — janela de settle antes de enviar volta nova
                 // v2.5.1 EVOLUCAO: settle "inteligente". Se LastLapTime ja vem
                 //   valido (>5s) no primeiro detect, envia IMEDIATO. Settle so
@@ -482,48 +526,45 @@ namespace SimSetups
                 //   exatamente no primeiro update apos cruzar a linha — entao
                 //   o LastLapTime ja vem certo nesse momento.
                 // ============================================================
-                if (!suspiciousJump &&
-                    newData.CompletedLaps > 0 &&
-                    newData.CompletedLaps > _lastSentLapNumber &&
-                    (newData.CompletedLaps > _lastCompletedLaps || newData.LastLapTime.TotalSeconds > 5.0))
+                if (fallbackTrigger ||
+                    (!suspiciousJump &&
+                     newData.CompletedLaps > 0 &&
+                     newData.CompletedLaps > _lastSentLapNumber &&
+                     (newData.CompletedLaps > _lastCompletedLaps || newData.LastLapTime.TotalSeconds > 5.0)))
                 {
                     bool readyToSend = true;
                     bool lapTimeAlreadyValid = newData.LastLapTime.TotalSeconds > 5.0;
 
                     if (FIX_SETTLE_WINDOW)
                     {
-                        if (_pendingLapNumber != newData.CompletedLaps)
+                        if (_pendingLapNumber != targetLapNumber)
                         {
                             // primeira deteccao — arma a janela e captura snapshot AGORA
-                            // (snapshot-on-detect, v2.5.1: se houver settle, o envio
-                            //  vai usar dados confiaveis capturados nesse instante,
-                            //  nao dados eventualmente contaminados pela animacao)
-                            _pendingLapNumber = newData.CompletedLaps;
+                            _pendingLapNumber = targetLapNumber;
                             _pendingLapDetectedAt = DateTime.Now;
                             UpdateFinalLapSnapshot(newData, data, compound, playerOpp);
-                            Log("LAP DETECT lap=" + newData.CompletedLaps + " lastLapTime=" + newData.LastLapTime.TotalSeconds.ToString("F3") + " validNow=" + lapTimeAlreadyValid);
+                            Log("LAP DETECT lap=" + targetLapNumber + " lastLapTime=" + newData.LastLapTime.TotalSeconds.ToString("F3") + " validNow=" + lapTimeAlreadyValid + " fallback=" + fallbackTrigger);
 
-                            // v2.5.1: se LastLapTime ja eh valido, NAO espera settle — envia imediato
                             if (!lapTimeAlreadyValid) readyToSend = false;
                         }
                         else if (!lapTimeAlreadyValid)
                         {
-                            // Mesma volta detectada de novo, e LastLapTime ainda zero —
-                            // espera settle preencher
                             double elapsedMs = (DateTime.Now - _pendingLapDetectedAt).TotalMilliseconds;
                             if (elapsedMs < SETTLE_WINDOW_MS)
                             {
                                 readyToSend = false;
                             }
                         }
-                        // else: pending mesma volta E LastLapTime agora valido → readyToSend=true (envia)
                     }
 
                     if (readyToSend)
                     {
-                        if (SendLap(newData, data, compound, playerOpp))
+                        // v2.5.3: passa lapNumberOverride se for fallback
+                        int overrideLap = fallbackTrigger ? targetLapNumber : -1;
+                        if (SendLap(newData, data, compound, playerOpp, overrideLap))
                         {
-                            _lastSentLapNumber = newData.CompletedLaps;
+                            _lastSentLapNumber = targetLapNumber;
+                            _lastSentLapTime = newData.LastLapTime.TotalSeconds;  // v2.5.3: rastreia tempo
                             _tireAgeLaps++;
                             ResetLapInputCounters();
                         }
@@ -821,11 +862,12 @@ namespace SimSetups
             try { return Convert.ToDouble(v); } catch { return 0.0; }
         }
 
-        private bool SendLap(StatusDataBase d, GameData data, string compound, Opponent playerOpp)
+        private bool SendLap(StatusDataBase d, GameData data, string compound, Opponent playerOpp, int lapNumberOverride = -1)
         {
             try
             {
-                int completedLaps = d.CompletedLaps;
+                // v2.5.3: se for fallback, usa o override; senao, usa o CompletedLaps do SDB
+                int completedLaps = lapNumberOverride > 0 ? lapNumberOverride : d.CompletedLaps;
                 double lapTimeSec = d.LastLapTime.TotalSeconds;
                 double s1 = d.Sector1LastLapTime?.TotalSeconds ?? 0.0;
                 double s2 = d.Sector2LastLapTime?.TotalSeconds ?? 0.0;
@@ -850,8 +892,12 @@ namespace SimSetups
                 }
 
                 // (1) Cross-check with player's own opponent record
-                if (playerOpp != null)
+                if (playerOpp != null && lapNumberOverride <= 0)
                 {
+                    // v2.5.3: cross-check de playerOpp NAO se aplica em fallback
+                    // (no cenario fallback, F1 25 trava CompletedLaps E playerOpp.CurrentLap juntos,
+                    //  entao a comparacao "oppLap-1-completedLaps" daria sempre mismatch.
+                    //  A defesa anti-spectator no fallback fica pelos checks de input ratio abaixo.)
                     int oppLap = SafeInt(GetMember(playerOpp, "CurrentLap"));
                     double oppLastLap = ParseLapTimeSeconds(GetMember(playerOpp, "LastLapTime"));
 
