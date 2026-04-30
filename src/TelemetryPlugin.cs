@@ -12,12 +12,12 @@ using SimHub.Plugins;
 
 namespace SimSetups
 {
-    [PluginDescription("Sim Setups Telemetry Plugin (v2.5.1 com fixes para ultima volta e validacao anti-spectator robusta)")]
+    [PluginDescription("Sim Setups Telemetry Plugin (v2.5.2 com diagnostico amplo)")]
     [PluginAuthor("SimSetups")]
     [PluginName("Sim Setups Telemetry")]
     public class TelemetryPlugin : IPlugin, IDataPlugin
     {
-        private const string VERSION = "2.5.1";
+        private const string VERSION = "2.5.2";
         private const int TRACE_HZ = 10;
 
         // ============================================================
@@ -75,6 +75,19 @@ namespace SimSetups
         //  2. validar contra o playerOpp.LastLapTime atualizado
         private int _pendingLapNumber = -1;
         private DateTime _pendingLapDetectedAt = DateTime.MinValue;
+
+        // ============================================================
+        // v2.5.2 — campos de diagnostico amplo
+        // Registram estado interno periodicamente pra diagnosticar bug
+        // intermitente da ultima volta (DLL parando de detectar volta nova)
+        // ============================================================
+        private DateTime _lastHeartbeatLog = DateTime.MinValue;
+        private DateTime _lastDataUpdateAt = DateTime.MinValue;
+        private long _dataUpdateCallsTotal;       // contador total de chamadas
+        private long _dataUpdateCallsSinceLastLog; // contador desde ultimo heartbeat
+        private int _lastSeenCompletedLaps = -1;  // pra detectar TODA mudança em CompletedLaps
+        private double _lastSeenLastLapTime = -1.0; // pra detectar TODA mudança em LastLapTime
+        private bool _lastSeenGamePaused = false;
 
         public PluginManager PluginManager { get; set; }
 
@@ -139,6 +152,13 @@ namespace SimSetups
 
         public void End(PluginManager pluginManager)
         {
+            // v2.5.2 — log de chamada do End (raro, ajuda diagnostico)
+            Log("End() called. _sessionActive=" + _sessionActive +
+                " _sessionId=" + (_sessionId ?? "null") +
+                " _lastSentLapNumber=" + _lastSentLapNumber +
+                " _lastCompletedLaps=" + _lastCompletedLaps +
+                " dataUpdateCalls=" + _dataUpdateCallsTotal);
+
             if (!_sessionActive || string.IsNullOrEmpty(_sessionId)) return;
 
             // === v2.5.0 FIX 1 — flush da ultima volta antes de fechar a sessao ===
@@ -260,10 +280,64 @@ namespace SimSetups
 
         public void DataUpdate(PluginManager pluginManager, ref GameData data)
         {
+            // v2.5.2 — contar TODA chamada, mesmo que falhe na guard inicial
+            _dataUpdateCallsTotal++;
+            _dataUpdateCallsSinceLastLog++;
+            _lastDataUpdateAt = DateTime.Now;
+
             if (string.IsNullOrEmpty(_apiToken) || data == null || data.NewData == null) return;
             StatusDataBase newData = data.NewData;
             try
             {
+                // ============================================================
+                // v2.5.2 DIAGNOSTICO 1 — logar TODA mudança em CompletedLaps e LastLapTime
+                // (mesmo que nao dispare detect — ajuda a ver se DataUpdate continua chegando)
+                // ============================================================
+                int curCompletedLaps = newData.CompletedLaps;
+                double curLastLapTime = newData.LastLapTime.TotalSeconds;
+                bool curGamePaused = SafeGetGamePaused(data);
+
+                if (curCompletedLaps != _lastSeenCompletedLaps)
+                {
+                    Log("STATE_CHG completedLaps: " + _lastSeenCompletedLaps + " -> " + curCompletedLaps +
+                        " | lastLapTime=" + curLastLapTime.ToString("F3") +
+                        " | _lastSent=" + _lastSentLapNumber +
+                        " | _lastCompleted=" + _lastCompletedLaps +
+                        " | _pending=" + _pendingLapNumber);
+                    _lastSeenCompletedLaps = curCompletedLaps;
+                }
+                if (Math.Abs(curLastLapTime - _lastSeenLastLapTime) > 0.001)
+                {
+                    Log("STATE_CHG lastLapTime: " + _lastSeenLastLapTime.ToString("F3") + " -> " + curLastLapTime.ToString("F3") +
+                        " | completedLaps=" + curCompletedLaps);
+                    _lastSeenLastLapTime = curLastLapTime;
+                }
+                if (curGamePaused != _lastSeenGamePaused)
+                {
+                    Log("STATE_CHG gamePaused: " + _lastSeenGamePaused + " -> " + curGamePaused +
+                        " | completedLaps=" + curCompletedLaps + " | lastLapTime=" + curLastLapTime.ToString("F3"));
+                    _lastSeenGamePaused = curGamePaused;
+                }
+
+                // ============================================================
+                // v2.5.2 DIAGNOSTICO 2 — heartbeat a cada 5s
+                // Confirma que DataUpdate continua sendo chamado
+                // ============================================================
+                if ((DateTime.Now - _lastHeartbeatLog).TotalSeconds >= 5.0)
+                {
+                    Log("HEARTBEAT updates=" + _dataUpdateCallsSinceLastLog +
+                        " total=" + _dataUpdateCallsTotal +
+                        " | completedLaps=" + curCompletedLaps +
+                        " | lastLapTime=" + curLastLapTime.ToString("F3") +
+                        " | _lastSent=" + _lastSentLapNumber +
+                        " | _lastCompleted=" + _lastCompletedLaps +
+                        " | _pending=" + _pendingLapNumber +
+                        " | gamePaused=" + curGamePaused +
+                        " | session=" + (_sessionType ?? "none"));
+                    _lastHeartbeatLog = DateTime.Now;
+                    _dataUpdateCallsSinceLastLog = 0;
+                }
+
                 string track = newData.TrackName ?? "";
                 string sessionType = newData.SessionTypeName ?? "race";
                 string compound = ExtractCompound(data);
@@ -470,7 +544,16 @@ namespace SimSetups
                 _lastCompletedLaps = newData.CompletedLaps;
                 _totalLaps = newData.TotalLaps;
             }
-            catch (Exception ex) { Log("DataUpdate error: " + ex.Message); }
+            catch (Exception ex)
+            {
+                // v2.5.2 — stack trace completa pra diagnostico
+                Log("DataUpdate error: " + ex.GetType().Name + ": " + ex.Message);
+                Log("DataUpdate stack: " + (ex.StackTrace ?? "(no stack)"));
+                if (ex.InnerException != null)
+                {
+                    Log("DataUpdate inner: " + ex.InnerException.GetType().Name + ": " + ex.InnerException.Message);
+                }
+            }
         }
 
         // ============================================================
@@ -535,6 +618,28 @@ namespace SimSetups
         // Em F1 25 UDP, o campo m_networkGame indica se eh sessao online.
         // Se nao conseguirmos detectar (campo nao exposto), retornamos false (offline).
         // ============================================================
+        // ============================================================
+        // v2.5.2 — detectar se jogo esta pausado (via reflection no SDB)
+        // ============================================================
+        private bool SafeGetGamePaused(GameData data)
+        {
+            try
+            {
+                if (data == null) return false;
+                // Tenta direto em GameData (mais comum)
+                object v = GetMember(data, "GamePaused") ?? GetMember(data, "IsPaused");
+                if (v is bool b1) return b1;
+                // Fallback: NewData
+                if (data.NewData != null)
+                {
+                    object v2 = GetMember(data.NewData, "GamePaused") ?? GetMember(data.NewData, "IsPaused");
+                    if (v2 is bool b2) return b2;
+                }
+            }
+            catch { }
+            return false;
+        }
+
         private bool DetectOnlineSession(GameData data)
         {
             try
