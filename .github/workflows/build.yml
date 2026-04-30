@@ -43,6 +43,8 @@ jobs:
                  Select-Object -First 1
           if (-not $dll) { Write-Error "DLL not found in any Release folder"; exit 1 }
           Write-Host "Found: $($dll.FullName)"
+          # SimHub espera o arquivo com nome SimSetups_TelemetryPlugin.dll (underscore),
+          # entao copiamos com o nome correto pra o artifact.
           $outDir = "build-output"
           New-Item -ItemType Directory -Force -Path $outDir | Out-Null
           Copy-Item $dll.FullName -Destination "$outDir\SimSetups_TelemetryPlugin.dll"
