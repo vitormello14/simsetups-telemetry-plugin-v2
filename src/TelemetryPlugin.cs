@@ -12,12 +12,12 @@ using SimHub.Plugins;
 
 namespace SimSetups
 {
-    [PluginDescription("Sim Setups Telemetry Plugin (v2.5.0 com fixes para ultima volta e validacao anti-spectator robusta)")]
+    [PluginDescription("Sim Setups Telemetry Plugin (v2.5.1 com fixes para ultima volta e validacao anti-spectator robusta)")]
     [PluginAuthor("SimSetups")]
     [PluginName("Sim Setups Telemetry")]
     public class TelemetryPlugin : IPlugin, IDataPlugin
     {
-        private const string VERSION = "2.5.0";
+        private const string VERSION = "2.5.1";
         private const int TRACE_HZ = 10;
 
         // ============================================================
@@ -33,6 +33,7 @@ namespace SimSetups
 
         private string _apiToken;
         private string _endpoint;
+        private string _logFilePath;            // v2.5.1 — arquivo de log proprio (Console.WriteLine nao aparece no log do SimHub)
         private string _sessionId;
         private string _currentTrack;
         private string _sessionType;
@@ -102,6 +103,18 @@ namespace SimSetups
         public void Init(PluginManager pluginManager)
         {
             string baseDirectory = AppDomain.CurrentDomain.BaseDirectory;
+            // v2.5.1 — inicializa logger em arquivo ANTES de qualquer Log()
+            _logFilePath = Path.Combine(baseDirectory, "SimSetups_Plugin.log");
+            try
+            {
+                File.AppendAllText(_logFilePath,
+                    Environment.NewLine +
+                    "=========================================" + Environment.NewLine +
+                    "=== Plugin v" + VERSION + " started at " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + " ===" + Environment.NewLine +
+                    "=========================================" + Environment.NewLine);
+            }
+            catch { }
+
             string path = Path.Combine(baseDirectory, "SimSetups_Token.txt");
             if (File.Exists(path)) _apiToken = File.ReadAllText(path).Trim();
             if (string.IsNullOrEmpty(_apiToken))
@@ -382,11 +395,18 @@ namespace SimSetups
 
                 // ============================================================
                 // v2.5.0 FIX 4 — janela de settle antes de enviar volta nova
-                // Espera SETTLE_WINDOW_MS apos primeira deteccao pra:
-                //   - LastLapTime estabilizar (as vezes vem 0 no primeiro update apos cruzar a linha)
-                //   - playerOpp.LastLapTime atualizar pra confirmar valor
-                // Tambem combina com FIX 1: enquanto espera, snapshot fica atualizada
-                //   pro caso de o usuario sair do jogo durante a janela.
+                // v2.5.1 EVOLUCAO: settle "inteligente". Se LastLapTime ja vem
+                //   valido (>5s) no primeiro detect, envia IMEDIATO. Settle so
+                //   ativa se LastLapTime ainda eh zero (raro no F1 25, mas pode
+                //   acontecer em outros jogos).
+                //
+                // POR QUE: o F1 25 entra em animacao cinematografica logo apos
+                //   a ultima volta da corrida (~30ms depois) e troca a camera
+                //   pro vencedor. Esperar 200ms = perder a volta.
+                //
+                // O SimHub gera "New valid lap detected" no GameReaderCommon
+                //   exatamente no primeiro update apos cruzar a linha — entao
+                //   o LastLapTime ja vem certo nesse momento.
                 // ============================================================
                 if (!suspiciousJump &&
                     newData.CompletedLaps > 0 &&
@@ -394,24 +414,35 @@ namespace SimSetups
                     (newData.CompletedLaps > _lastCompletedLaps || newData.LastLapTime.TotalSeconds > 5.0))
                 {
                     bool readyToSend = true;
+                    bool lapTimeAlreadyValid = newData.LastLapTime.TotalSeconds > 5.0;
 
                     if (FIX_SETTLE_WINDOW)
                     {
                         if (_pendingLapNumber != newData.CompletedLaps)
                         {
-                            // primeira deteccao — arma a janela
+                            // primeira deteccao — arma a janela e captura snapshot AGORA
+                            // (snapshot-on-detect, v2.5.1: se houver settle, o envio
+                            //  vai usar dados confiaveis capturados nesse instante,
+                            //  nao dados eventualmente contaminados pela animacao)
                             _pendingLapNumber = newData.CompletedLaps;
                             _pendingLapDetectedAt = DateTime.Now;
-                            readyToSend = false;
+                            UpdateFinalLapSnapshot(newData, data, compound, playerOpp);
+                            Log("LAP DETECT lap=" + newData.CompletedLaps + " lastLapTime=" + newData.LastLapTime.TotalSeconds.ToString("F3") + " validNow=" + lapTimeAlreadyValid);
+
+                            // v2.5.1: se LastLapTime ja eh valido, NAO espera settle — envia imediato
+                            if (!lapTimeAlreadyValid) readyToSend = false;
                         }
-                        else
+                        else if (!lapTimeAlreadyValid)
                         {
+                            // Mesma volta detectada de novo, e LastLapTime ainda zero —
+                            // espera settle preencher
                             double elapsedMs = (DateTime.Now - _pendingLapDetectedAt).TotalMilliseconds;
                             if (elapsedMs < SETTLE_WINDOW_MS)
                             {
                                 readyToSend = false;
                             }
                         }
+                        // else: pending mesma volta E LastLapTime agora valido → readyToSend=true (envia)
                     }
 
                     if (readyToSend)
@@ -915,9 +946,23 @@ namespace SimSetups
             }
         }
 
+        // ============================================================
+        // v2.5.1 — Logging em arquivo proprio
+        // Console.WriteLine nao aparece no log do SimHub (descartado pelo NLog interno).
+        // Escrevemos em arquivo "SimSetups_Plugin.log" na mesma pasta do Token.txt.
+        // Usuario pode abrir esse arquivo pra debug ou nos enviar quando algo der ruim.
+        // ============================================================
         private void Log(string msg)
         {
-            try { Console.WriteLine("[SimSetups] " + msg); } catch { }
+            string ts = DateTime.Now.ToString("HH:mm:ss.fff");
+            string line = "[" + ts + "] " + msg;
+            try { Console.WriteLine("[SimSetups] " + line); } catch { }
+            if (string.IsNullOrEmpty(_logFilePath)) return;
+            try
+            {
+                File.AppendAllText(_logFilePath, line + Environment.NewLine);
+            }
+            catch { }
         }
     }
 }
