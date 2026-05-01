@@ -12,12 +12,12 @@ using SimHub.Plugins;
 
 namespace SimSetups
 {
-    [PluginDescription("Sim Setups Telemetry Plugin (v2.5.3 fix definitivo - fallback LastLapTime)")]
+    [PluginDescription("Sim Setups Telemetry Plugin (v2.5.4 - setup snapshot + log enxuto + spectator detect + cross-check em fallback)")]
     [PluginAuthor("SimSetups")]
     [PluginName("Sim Setups Telemetry")]
     public class TelemetryPlugin : IPlugin, IDataPlugin
     {
-        private const string VERSION = "2.5.3";
+        private const string VERSION = "2.5.4";
         private const int TRACE_HZ = 10;
 
         // ============================================================
@@ -31,6 +31,15 @@ namespace SimSetups
         private const bool FIX_SETTLE_WINDOW        = true;  // espera 200ms apos detectar volta nova
         private const bool FIX_LASTLAPTIME_FALLBACK = true;  // v2.5.3: detecta volta quando LastLapTime muda mas CompletedLaps trava
         private const int  SETTLE_WINDOW_MS         = 200;
+
+        // ============================================================
+        // v2.5.4 — flags novas
+        // ============================================================
+        private const bool CAPTURE_SETUP            = true;  // v2.5.4: captura setup do player no inicio da sessao
+        private const bool VERBOSE_LOG              = false; // v2.5.4: false = log enxuto (producao), true = log diagnostico amplo
+        private const bool FIX_SPECTATOR_DETECT     = true;  // v2.5.4: detecta m_isSpectating do F1 25 e bloqueia voltas em modo espectador
+        private const bool FIX_FALLBACK_OPPCHECK    = true;  // v2.5.4: cross-check de LastLapTime com playerOpp tambem em fallback (pega bug do Daniel)
+        private const bool FIX_RETRY_THROTTLE       = true;  // v2.5.4: nao retenta enviar volta ja rejeitada com mesmo lastLapTime (evita spam de log)
 
         private string _apiToken;
         private string _endpoint;
@@ -93,6 +102,21 @@ namespace SimSetups
         // ============================================================
         private double _lastSentLapTime = 0.0;        // tempo (s) da volta enviada por ultimo
         private double _lastFallbackTriedTime = 0.0;  // ultimo LastLapTime que tentamos fallback (evita re-trigger)
+
+        // ============================================================
+        // v2.5.4 — campos de captura de setup
+        // O setup é capturado uma vez por sessão (quando New session é detectada)
+        // e enviado junto com o payload da primeira volta da sessão.
+        // ============================================================
+        private Dictionary<string, object> _capturedSetup = null;  // setup do player (null = ainda nao capturado nessa sessao)
+        private bool _setupSentForSession = false;                 // se ja foi enviado nessa sessao
+
+        // ============================================================
+        // v2.5.4 — retry throttle
+        // Evita re-tentar enviar a mesma volta rejeitada 50x/segundo (spam de log).
+        // Uma vez rejeitada, só tenta de novo se o lastLapTime ou completedLaps mudar.
+        // ============================================================
+        private string _lastRejectedKey = null;
 
         // ============================================================
         // v2.5.2 — campos de diagnostico amplo
@@ -310,50 +334,61 @@ namespace SimSetups
                 // ============================================================
                 // v2.5.2 DIAGNOSTICO 1 — logar TODA mudança em CompletedLaps e LastLapTime
                 // (mesmo que nao dispare detect — ajuda a ver se DataUpdate continua chegando)
+                // v2.5.4: só roda se VERBOSE_LOG=true. Em produção fica desligado.
                 // ============================================================
                 int curCompletedLaps = newData.CompletedLaps;
                 double curLastLapTime = newData.LastLapTime.TotalSeconds;
                 bool curGamePaused = SafeGetGamePaused(data);
 
-                if (curCompletedLaps != _lastSeenCompletedLaps)
+                if (VERBOSE_LOG)
                 {
-                    Log("STATE_CHG completedLaps: " + _lastSeenCompletedLaps + " -> " + curCompletedLaps +
-                        " | lastLapTime=" + curLastLapTime.ToString("F3") +
-                        " | _lastSent=" + _lastSentLapNumber +
-                        " | _lastCompleted=" + _lastCompletedLaps +
-                        " | _pending=" + _pendingLapNumber);
-                    _lastSeenCompletedLaps = curCompletedLaps;
-                }
-                if (Math.Abs(curLastLapTime - _lastSeenLastLapTime) > 0.001)
-                {
-                    Log("STATE_CHG lastLapTime: " + _lastSeenLastLapTime.ToString("F3") + " -> " + curLastLapTime.ToString("F3") +
-                        " | completedLaps=" + curCompletedLaps);
-                    _lastSeenLastLapTime = curLastLapTime;
-                }
-                if (curGamePaused != _lastSeenGamePaused)
-                {
-                    Log("STATE_CHG gamePaused: " + _lastSeenGamePaused + " -> " + curGamePaused +
-                        " | completedLaps=" + curCompletedLaps + " | lastLapTime=" + curLastLapTime.ToString("F3"));
-                    _lastSeenGamePaused = curGamePaused;
-                }
+                    if (curCompletedLaps != _lastSeenCompletedLaps)
+                    {
+                        Log("STATE_CHG completedLaps: " + _lastSeenCompletedLaps + " -> " + curCompletedLaps +
+                            " | lastLapTime=" + curLastLapTime.ToString("F3") +
+                            " | _lastSent=" + _lastSentLapNumber +
+                            " | _lastCompleted=" + _lastCompletedLaps +
+                            " | _pending=" + _pendingLapNumber);
+                        _lastSeenCompletedLaps = curCompletedLaps;
+                    }
+                    if (Math.Abs(curLastLapTime - _lastSeenLastLapTime) > 0.001)
+                    {
+                        Log("STATE_CHG lastLapTime: " + _lastSeenLastLapTime.ToString("F3") + " -> " + curLastLapTime.ToString("F3") +
+                            " | completedLaps=" + curCompletedLaps);
+                        _lastSeenLastLapTime = curLastLapTime;
+                    }
+                    if (curGamePaused != _lastSeenGamePaused)
+                    {
+                        Log("STATE_CHG gamePaused: " + _lastSeenGamePaused + " -> " + curGamePaused +
+                            " | completedLaps=" + curCompletedLaps + " | lastLapTime=" + curLastLapTime.ToString("F3"));
+                        _lastSeenGamePaused = curGamePaused;
+                    }
 
-                // ============================================================
-                // v2.5.2 DIAGNOSTICO 2 — heartbeat a cada 5s
-                // Confirma que DataUpdate continua sendo chamado
-                // ============================================================
-                if ((DateTime.Now - _lastHeartbeatLog).TotalSeconds >= 5.0)
+                    // ============================================================
+                    // v2.5.2 DIAGNOSTICO 2 — heartbeat a cada 5s
+                    // Confirma que DataUpdate continua sendo chamado
+                    // ============================================================
+                    if ((DateTime.Now - _lastHeartbeatLog).TotalSeconds >= 5.0)
+                    {
+                        Log("HEARTBEAT updates=" + _dataUpdateCallsSinceLastLog +
+                            " total=" + _dataUpdateCallsTotal +
+                            " | completedLaps=" + curCompletedLaps +
+                            " | lastLapTime=" + curLastLapTime.ToString("F3") +
+                            " | _lastSent=" + _lastSentLapNumber +
+                            " | _lastCompleted=" + _lastCompletedLaps +
+                            " | _pending=" + _pendingLapNumber +
+                            " | gamePaused=" + curGamePaused +
+                            " | session=" + (_sessionType ?? "none"));
+                        _lastHeartbeatLog = DateTime.Now;
+                        _dataUpdateCallsSinceLastLog = 0;
+                    }
+                }
+                else
                 {
-                    Log("HEARTBEAT updates=" + _dataUpdateCallsSinceLastLog +
-                        " total=" + _dataUpdateCallsTotal +
-                        " | completedLaps=" + curCompletedLaps +
-                        " | lastLapTime=" + curLastLapTime.ToString("F3") +
-                        " | _lastSent=" + _lastSentLapNumber +
-                        " | _lastCompleted=" + _lastCompletedLaps +
-                        " | _pending=" + _pendingLapNumber +
-                        " | gamePaused=" + curGamePaused +
-                        " | session=" + (_sessionType ?? "none"));
-                    _lastHeartbeatLog = DateTime.Now;
-                    _dataUpdateCallsSinceLastLog = 0;
+                    // Modo produção — só atualiza os _lastSeen pra não disparar logs depois se VERBOSE for ligado em runtime no futuro
+                    _lastSeenCompletedLaps = curCompletedLaps;
+                    _lastSeenLastLapTime = curLastLapTime;
+                    _lastSeenGamePaused = curGamePaused;
                 }
 
                 string track = newData.TrackName ?? "";
@@ -406,7 +441,20 @@ namespace SimSetups
                     _lastSnapshot = null;
                     _pendingLapNumber = -1;
                     _pendingLapDetectedAt = DateTime.MinValue;
+                    // === v2.5.4 — reset do setup capture ===
+                    _capturedSetup = null;
+                    _setupSentForSession = false;
+                    // === v2.5.4 — reset do retry throttle ===
+                    _lastRejectedKey = null;
                     Log("New session detected: " + track + " / " + sessionType + " / compound: " + compound);
+                }
+
+                // === v2.5.4 — captura do setup do player ===
+                // Tenta capturar o setup uma vez por sessão. Se falhar (ex: packet
+                // ainda não chegou), tenta de novo no próximo DataUpdate até conseguir.
+                if (CAPTURE_SETUP && _sessionActive && _capturedSetup == null)
+                {
+                    _capturedSetup = CapturePlayerSetup(data);
                 }
 
                 if (compound != null && compound != "unknown" && compound != _currentCompound)
@@ -532,6 +580,39 @@ namespace SimSetups
                      newData.CompletedLaps > _lastSentLapNumber &&
                      (newData.CompletedLaps > _lastCompletedLaps || newData.LastLapTime.TotalSeconds > 5.0)))
                 {
+                    // ============================================================
+                    // v2.5.4 FIX_SPECTATOR_DETECT — defesa raiz contra bug do espectador
+                    // Antes de qualquer processamento, verifica se o jogador esta em
+                    // modo espectador (assistindo outro carro). Se sim, bloqueia a
+                    // volta INDEPENDENTEMENTE do trigger (normal ou fallback).
+                    //
+                    // Esta defesa pega o cenario que furou na v2.5.3:
+                    //   - Daniel espectando -> outro piloto cruza linha
+                    //   - LastLapTime no SDB muda pro tempo do outro
+                    //   - Trigger normal OU fallback dispara
+                    //   - Sem a verificacao de spectator, volta era enviada
+                    // ============================================================
+                    if (FIX_SPECTATOR_DETECT && DetectSpectatorMode(data))
+                    {
+                        // Throttle de log: só loga uma vez por par (lap, lastLapTime)
+                        string spectatorKey = "SPEC:" + targetLapNumber + ":" + newData.LastLapTime.TotalSeconds.ToString("F3");
+                        if (_lastRejectedKey != spectatorKey)
+                        {
+                            Log("LAP REJECTED #" + targetLapNumber + " lastLapTime=" + newData.LastLapTime.TotalSeconds.ToString("F3") + " reasons=[spectator_mode_detected] fallback=" + fallbackTrigger);
+                            _lastRejectedKey = spectatorKey;
+                        }
+                        // Marca como "vista" pra nao ficar tentando: simula que ja foi enviada
+                        // mas atualiza tambem _lastSentLapTime pra o fallback proximo nao re-disparar
+                        _lastSentLapNumber = targetLapNumber;
+                        _lastSentLapTime = newData.LastLapTime.TotalSeconds;
+                        _lastFallbackTriedTime = newData.LastLapTime.TotalSeconds;
+                        _pendingLapNumber = -1;
+                        // continua o resto do DataUpdate normalmente (snapshot etc)
+                        _lastCompletedLaps = newData.CompletedLaps;
+                        _totalLaps = newData.TotalLaps;
+                        return;
+                    }
+
                     bool readyToSend = true;
                     bool lapTimeAlreadyValid = newData.LastLapTime.TotalSeconds > 5.0;
 
@@ -567,6 +648,15 @@ namespace SimSetups
                             _lastSentLapTime = newData.LastLapTime.TotalSeconds;  // v2.5.3: rastreia tempo
                             _tireAgeLaps++;
                             ResetLapInputCounters();
+                        }
+                        else if (FIX_RETRY_THROTTLE)
+                        {
+                            // v2.5.4: SendLap rejeitou. Marca como tentada pra não retry em loop.
+                            // Atualizamos os estados pra simular que foi processada — proximo trigger
+                            // só dispara se completedLaps OU lastLapTime mudar.
+                            _lastSentLapNumber = targetLapNumber;
+                            _lastSentLapTime = newData.LastLapTime.TotalSeconds;
+                            _lastFallbackTriedTime = newData.LastLapTime.TotalSeconds;
                         }
                         _pendingLapNumber = -1;
                     }
@@ -662,6 +752,186 @@ namespace SimSetups
         // ============================================================
         // v2.5.2 — detectar se jogo esta pausado (via reflection no SDB)
         // ============================================================
+        // ============================================================
+        // v2.5.4 — Captura do setup do player via reflection
+        // Lê o PacketCarSetupData (Packet ID 5 do F1 25 UDP spec v3) através
+        // do GameRawData. Estrutura: m_carSetups[m_playerCarIndex] contém todos
+        // os campos do setup do carro do jogador.
+        //
+        // Estrutura esperada (F1 25 UDP spec):
+        //   PacketCarSetupData {
+        //     m_header: PacketHeader (contém m_playerCarIndex)
+        //     m_carSetups: CarSetupData[22]
+        //     ...
+        //   }
+        //   CarSetupData {
+        //     m_frontWing, m_rearWing,
+        //     m_onThrottle, m_offThrottle,
+        //     m_frontCamber, m_rearCamber,
+        //     m_frontToe, m_rearToe,
+        //     m_frontSuspension, m_rearSuspension,
+        //     m_frontAntiRollBar, m_rearAntiRollBar,
+        //     m_frontSuspensionHeight, m_rearSuspensionHeight,
+        //     m_brakePressure, m_brakeBias,
+        //     m_engineBraking,
+        //     m_rearLeftTyrePressure, m_rearRightTyrePressure,
+        //     m_frontLeftTyrePressure, m_frontRightTyrePressure,
+        //     m_ballast, m_fuelLoad
+        //   }
+        //
+        // Retorna null se não conseguir capturar (usuario em sessão sem setup,
+        // packet ainda não chegou, ou estrutura mudou em update do jogo).
+        // ============================================================
+        private Dictionary<string, object> CapturePlayerSetup(GameData data)
+        {
+            try
+            {
+                if (data == null || data.NewData == null) return null;
+
+                // Acessar GameRawData (objeto que o SimHub expõe contendo os pacotes UDP brutos)
+                object raw = GetMember(data.NewData, "GameRawData");
+                if (raw == null) raw = GetMember(data, "GameRawData");
+                if (raw == null) return null;
+
+                // O GameRawData contém múltiplos packets. PacketCarSetupData
+                // pode estar exposto como propriedade direta ("CarSetups" ou similar)
+                // ou aninhado. Tentamos várias possibilidades comuns no SimHub F1 25 reader.
+                object carSetupsArray = null;
+                object header = null;
+                int playerCarIndex = -1;
+
+                // Tentativas de localizar o array de setups
+                string[] candidatesArray = new string[] {
+                    "CarSetups", "m_carSetups", "carSetups",
+                    "PacketCarSetupData", "CarSetupData"
+                };
+                foreach (string name in candidatesArray)
+                {
+                    object v = GetMember(raw, name);
+                    if (v != null) { carSetupsArray = v; break; }
+                }
+
+                // Se não achou direto, pode estar dentro de um sub-objeto "CarSetupPacket"
+                if (carSetupsArray == null)
+                {
+                    object pkt = GetMember(raw, "CarSetupPacket") ?? GetMember(raw, "PacketCarSetup");
+                    if (pkt != null)
+                    {
+                        foreach (string name in candidatesArray)
+                        {
+                            object v = GetMember(pkt, name);
+                            if (v != null) { carSetupsArray = v; break; }
+                        }
+                        // Header dentro do mesmo packet
+                        header = GetMember(pkt, "Header") ?? GetMember(pkt, "m_header");
+                    }
+                }
+
+                // Tentar pegar o playerCarIndex (necessário pra saber qual setup é do jogador)
+                if (header == null) header = GetMember(raw, "Header") ?? GetMember(raw, "m_header");
+                if (header != null)
+                {
+                    double? idx = FindNumeric(header, "playerCarIndex", "m_playerCarIndex", "PlayerCarIndex");
+                    if (idx.HasValue) playerCarIndex = (int)idx.Value;
+                }
+
+                // Se não conseguiu o índice, tenta o IsPlayer dos opponents (fallback)
+                if (playerCarIndex < 0 && data.NewData.Opponents != null)
+                {
+                    for (int i = 0; i < data.NewData.Opponents.Count; i++)
+                    {
+                        object op = data.NewData.Opponents[i];
+                        object isPlayer = GetMember(op, "IsPlayer");
+                        if (isPlayer is bool b && b) { playerCarIndex = i; break; }
+                    }
+                }
+
+                if (carSetupsArray == null || playerCarIndex < 0)
+                {
+                    if (VERBOSE_LOG) Log("CapturePlayerSetup: array=" + (carSetupsArray != null) + " playerIdx=" + playerCarIndex + " (não capturado)");
+                    return null;
+                }
+
+                // Pegar o setup específico do player. Pode ser array ou List.
+                object playerSetup = null;
+                if (carSetupsArray is System.Array arr)
+                {
+                    if (playerCarIndex < arr.Length) playerSetup = arr.GetValue(playerCarIndex);
+                }
+                else if (carSetupsArray is System.Collections.IList list)
+                {
+                    if (playerCarIndex < list.Count) playerSetup = list[playerCarIndex];
+                }
+                if (playerSetup == null) return null;
+
+                // Mapear todos os campos do CarSetupData. Tenta múltiplos nomes
+                // (com e sem prefixo m_, com variações de capitalização)
+                var setup = new Dictionary<string, object>();
+                AddSetupField(setup, playerSetup, "front_wing", "FrontWing", "m_frontWing");
+                AddSetupField(setup, playerSetup, "rear_wing", "RearWing", "m_rearWing");
+                AddSetupField(setup, playerSetup, "diff_on_throttle", "OnThrottle", "m_onThrottle");
+                AddSetupField(setup, playerSetup, "diff_off_throttle", "OffThrottle", "m_offThrottle");
+                AddSetupField(setup, playerSetup, "front_camber", "FrontCamber", "m_frontCamber");
+                AddSetupField(setup, playerSetup, "rear_camber", "RearCamber", "m_rearCamber");
+                AddSetupField(setup, playerSetup, "front_toe", "FrontToe", "m_frontToe");
+                AddSetupField(setup, playerSetup, "rear_toe", "RearToe", "m_rearToe");
+                AddSetupField(setup, playerSetup, "front_suspension", "FrontSuspension", "m_frontSuspension");
+                AddSetupField(setup, playerSetup, "rear_suspension", "RearSuspension", "m_rearSuspension");
+                AddSetupField(setup, playerSetup, "front_anti_roll_bar", "FrontAntiRollBar", "m_frontAntiRollBar");
+                AddSetupField(setup, playerSetup, "rear_anti_roll_bar", "RearAntiRollBar", "m_rearAntiRollBar");
+                AddSetupField(setup, playerSetup, "front_ride_height", "FrontSuspensionHeight", "m_frontSuspensionHeight");
+                AddSetupField(setup, playerSetup, "rear_ride_height", "RearSuspensionHeight", "m_rearSuspensionHeight");
+                AddSetupField(setup, playerSetup, "brake_pressure", "BrakePressure", "m_brakePressure");
+                AddSetupField(setup, playerSetup, "brake_bias", "BrakeBias", "m_brakeBias");
+                AddSetupField(setup, playerSetup, "engine_braking", "EngineBraking", "m_engineBraking");
+                AddSetupField(setup, playerSetup, "tyre_pressure_rl", "RearLeftTyrePressure", "m_rearLeftTyrePressure");
+                AddSetupField(setup, playerSetup, "tyre_pressure_rr", "RearRightTyrePressure", "m_rearRightTyrePressure");
+                AddSetupField(setup, playerSetup, "tyre_pressure_fl", "FrontLeftTyrePressure", "m_frontLeftTyrePressure");
+                AddSetupField(setup, playerSetup, "tyre_pressure_fr", "FrontRightTyrePressure", "m_frontRightTyrePressure");
+                AddSetupField(setup, playerSetup, "ballast", "Ballast", "m_ballast");
+                AddSetupField(setup, playerSetup, "fuel_load", "FuelLoad", "m_fuelLoad");
+
+                if (setup.Count == 0)
+                {
+                    Log("CapturePlayerSetup: setup obj encontrado mas nenhum campo lido (estrutura desconhecida)");
+                    return null;
+                }
+
+                Log("Setup captured: " + setup.Count + " fields");
+                return setup;
+            }
+            catch (Exception ex)
+            {
+                Log("CapturePlayerSetup error: " + ex.Message);
+                return null;
+            }
+        }
+
+        // Helper: tenta adicionar um campo ao dict tentando múltiplos nomes
+        private void AddSetupField(Dictionary<string, object> setup, object obj, string outKey, params string[] candidateNames)
+        {
+            foreach (string name in candidateNames)
+            {
+                object v = GetMember(obj, name);
+                if (v == null) continue;
+                // Convert numerics para double
+                if (v is float f) { setup[outKey] = (double)f; return; }
+                if (v is double d) { setup[outKey] = d; return; }
+                if (v is int i) { setup[outKey] = (double)i; return; }
+                if (v is long l) { setup[outKey] = (double)l; return; }
+                if (v is byte b) { setup[outKey] = (double)b; return; }
+                if (v is short s) { setup[outKey] = (double)s; return; }
+                // Se for string, tenta parsear
+                if (v is string str)
+                {
+                    if (double.TryParse(str, NumberStyles.Any, CultureInfo.InvariantCulture, out double dv))
+                    {
+                        setup[outKey] = dv; return;
+                    }
+                }
+            }
+        }
+
         private bool SafeGetGamePaused(GameData data)
         {
             try
@@ -679,6 +949,65 @@ namespace SimSetups
             }
             catch { }
             return false;
+        }
+
+        // ============================================================
+        // v2.5.4 — Detecta se o jogador está em modo espectador
+        //
+        // Esta é a defesa raiz contra o bug do Daniel:
+        // O F1 25 expõe (via PacketSessionData / PacketParticipantsData) campos
+        // que indicam quando o jogador NÃO está dirigindo o carro do "playerCarIndex".
+        //
+        // Tentamos múltiplos campos via reflection porque o SimHub pode expor com
+        // nomes diferentes dependendo da versão do reader:
+        //   - m_isSpectating: bool, no PacketSessionData (mais comum)
+        //   - m_spectatorCarIndex: byte, valor diferente de m_playerCarIndex = espectando
+        //   - IsSpectating, IsPaused, IsReplay: campos diretos do GameData
+        //
+        // Retorna true se confirmar espectador. Em caso de dúvida (não conseguiu
+        // determinar), retorna false (não bloqueia volta legítima).
+        // ============================================================
+        private bool DetectSpectatorMode(GameData data)
+        {
+            try
+            {
+                if (data == null || data.NewData == null) return false;
+
+                // Tentativa 1: campo direto isSpectating no GameData ou NewData
+                object v1 = GetMember(data.NewData, "IsSpectating") ?? GetMember(data, "IsSpectating");
+                if (v1 is bool b1 && b1) return true;
+
+                // Tentativa 2: campo isReplay (replay também é uma forma de "espectador")
+                object v2 = GetMember(data.NewData, "IsReplay") ?? GetMember(data, "IsReplay");
+                if (v2 is bool b2 && b2) return true;
+
+                // Tentativa 3: ler do GameRawData (PacketSessionData)
+                object raw = GetMember(data.NewData, "GameRawData");
+                if (raw == null) raw = GetMember(data, "GameRawData");
+                if (raw != null)
+                {
+                    // m_isSpectating direto
+                    double? spec = FindNumeric(raw, "isSpectating", "m_isSpectating", "IsSpectating");
+                    if (spec.HasValue && spec.Value > 0.5) return true;
+
+                    // Comparar m_spectatorCarIndex com m_playerCarIndex
+                    double? spectatorIdx = FindNumeric(raw, "spectatorCarIndex", "m_spectatorCarIndex", "SpectatorCarIndex");
+                    double? playerIdx = FindNumeric(raw, "playerCarIndex", "m_playerCarIndex", "PlayerCarIndex");
+
+                    // Em F1 25, spectatorCarIndex == 255 (0xFF) significa "não está espectando"
+                    // Qualquer outro valor diferente do playerCarIndex significa espectando
+                    if (spectatorIdx.HasValue && spectatorIdx.Value < 250)
+                    {
+                        if (!playerIdx.HasValue || (int)spectatorIdx.Value != (int)playerIdx.Value)
+                        {
+                            return true;
+                        }
+                    }
+                }
+
+                return false;
+            }
+            catch { return false; }
         }
 
         private bool DetectOnlineSession(GameData data)
@@ -892,36 +1221,36 @@ namespace SimSetups
                 }
 
                 // (1) Cross-check with player's own opponent record
-                if (playerOpp != null && lapNumberOverride <= 0)
+                if (playerOpp != null)
                 {
-                    // v2.5.3: cross-check de playerOpp NAO se aplica em fallback
-                    // (no cenario fallback, F1 25 trava CompletedLaps E playerOpp.CurrentLap juntos,
-                    //  entao a comparacao "oppLap-1-completedLaps" daria sempre mismatch.
-                    //  A defesa anti-spectator no fallback fica pelos checks de input ratio abaixo.)
                     int oppLap = SafeInt(GetMember(playerOpp, "CurrentLap"));
                     double oppLastLap = ParseLapTimeSeconds(GetMember(playerOpp, "LastLapTime"));
 
-                    // Player opponent lap counter should match (or be within 1 of) StatusDataBase
-                    if (oppLap > 0 && Math.Abs(oppLap - 1 - completedLaps) > 1)
+                    // === v2.5.4 FIX_FALLBACK_OPPCHECK ===
+                    // Cross-check de oppLap (lap counter): só aplica em trigger NORMAL.
+                    // Em fallback, F1 25 trava CompletedLaps E playerOpp.CurrentLap juntos,
+                    // então a comparação daria sempre mismatch (caso legítimo de última volta).
+                    if (lapNumberOverride <= 0)
                     {
-                        isValid = false;
-                        rejectReasons.Add("opponent_lap_mismatch(opp=" + oppLap + ",sdb=" + completedLaps + ")");
+                        if (oppLap > 0 && Math.Abs(oppLap - 1 - completedLaps) > 1)
+                        {
+                            isValid = false;
+                            rejectReasons.Add("opponent_lap_mismatch(opp=" + oppLap + ",sdb=" + completedLaps + ")");
+                        }
                     }
 
-                    // === v2.5.0 FIX 2c — sem Frankenstein ===
-                    // Se o lap_time do playerOpp diverge do SDB, REJEITAMOS A VOLTA INTEIRA.
-                    // A v2.4.x "consertava" o lap_time mas mantinha top_speed/wear/sectors do SDB
-                    // (que podia estar com dados do carro espectado). Resultado: volta misturada.
-                    // Agora: ou aceita tudo do SDB (validado) ou rejeita tudo. Sem meio-termo.
-                    if (oppLastLap > 5.0 && lapTimeSec > 5.0 && Math.Abs(oppLastLap - lapTimeSec) > 0.5)
+                    // === v2.5.4 FIX_FALLBACK_OPPCHECK ===
+                    // Cross-check de LastLapTime: aplica SEMPRE (incluindo fallback).
+                    // Esta é a defesa que pega o bug do Daniel:
+                    //   - Daniel em modo espectador, outro piloto cruza linha
+                    //   - LastLapTime no SDB muda pro tempo do outro
+                    //   - Mas playerOpp.LastLapTime NAO muda (continua sendo o tempo verdadeiro do Daniel)
+                    //   - Divergencia > 0.5s -> REJEITA
+                    if (FIX_FALLBACK_OPPCHECK && oppLastLap > 5.0 && lapTimeSec > 5.0 && Math.Abs(oppLastLap - lapTimeSec) > 0.5)
                     {
                         isValid = false;
-                        rejectReasons.Add("lap_time_mismatch(opp=" + oppLastLap.ToString("F3") + ",sdb=" + lapTimeSec.ToString("F3") + ")");
+                        rejectReasons.Add("lap_time_mismatch(opp=" + oppLastLap.ToString("F3") + ",sdb=" + lapTimeSec.ToString("F3") + ",fallback=" + (lapNumberOverride > 0) + ")");
                     }
-
-                    // === v2.5.0 — REMOVIDO o "lapTimeSec = oppLastLap" (Frankenstein) ===
-                    // Se a divergencia eh pequena (< 0.5s), aceita tudo do SDB sem alterar.
-                    // Se for grande, ja foi rejeitada acima.
                 }
 
                 // (2) Input-activity heuristic: a real player driving should produce
@@ -951,7 +1280,15 @@ namespace SimSetups
 
                 if (!isValid)
                 {
-                    Log("LAP REJECTED #" + completedLaps + " reasons=[" + string.Join(",", rejectReasons.ToArray()) + "]");
+                    // v2.5.4 FIX_RETRY_THROTTLE: evita spam de log e retry infinito
+                    // Quando uma volta é rejeitada, marcamos como "vista" pra não reprocessar
+                    // toda hora. Só vai disparar de novo se lapTimeSec ou lap mudar.
+                    string rejKey = "REJ:" + completedLaps + ":" + lapTimeSec.ToString("F3");
+                    if (!FIX_RETRY_THROTTLE || _lastRejectedKey != rejKey)
+                    {
+                        Log("LAP REJECTED #" + completedLaps + " lastLapTime=" + lapTimeSec.ToString("F3") + " reasons=[" + string.Join(",", rejectReasons.ToArray()) + "]");
+                        _lastRejectedKey = rejKey;
+                    }
                     _traceBuffer.Clear();
                     return false;
                 }
@@ -1004,6 +1341,14 @@ namespace SimSetups
                     { "plugin_version", VERSION }
                 };
                 if (!string.IsNullOrEmpty(_sessionId)) msg["session_id"] = _sessionId;
+
+                // v2.5.4 — anexa o setup do player na primeira volta enviada da sessão
+                if (CAPTURE_SETUP && !_setupSentForSession && _capturedSetup != null)
+                {
+                    msg["player_setup"] = _capturedSetup;
+                    _setupSentForSession = true;
+                    Log("Setup attached to lap " + completedLaps + " payload");
+                }
 
                 string resp = SendData(msg);
                 if (!string.IsNullOrEmpty(resp) && string.IsNullOrEmpty(_sessionId))
