@@ -12,12 +12,12 @@ using SimHub.Plugins;
 
 namespace SimSetups
 {
-    [PluginDescription("Sim Setups Telemetry Plugin (v2.5.4 - setup snapshot + log enxuto + spectator detect + cross-check em fallback)")]
+    [PluginDescription("Sim Setups Telemetry Plugin (v2.5.5 - defesas anti-spectator: pit_status + trace speed)")]
     [PluginAuthor("SimSetups")]
     [PluginName("Sim Setups Telemetry")]
     public class TelemetryPlugin : IPlugin, IDataPlugin
     {
-        private const string VERSION = "2.5.4";
+        private const string VERSION = "2.5.5";
         private const int TRACE_HZ = 10;
 
         // ============================================================
@@ -40,6 +40,24 @@ namespace SimSetups
         private const bool FIX_SPECTATOR_DETECT     = true;  // v2.5.4: detecta m_isSpectating do F1 25 e bloqueia voltas em modo espectador
         private const bool FIX_FALLBACK_OPPCHECK    = true;  // v2.5.4: cross-check de LastLapTime com playerOpp tambem em fallback (pega bug do Daniel)
         private const bool FIX_RETRY_THROTTLE       = true;  // v2.5.4: nao retenta enviar volta ja rejeitada com mesmo lastLapTime (evita spam de log)
+
+        // ============================================================
+        // v2.5.5 — defesas adicionais anti-spectator
+        // O FIX_SPECTATOR_DETECT da v2.5.4 falha em alguns cenários online
+        // (Daniel teve voltas falsas em Baku 19:14). Adicionamos 2 camadas
+        // ortogonais que NÃO dependem do SimHub expor m_isSpectating:
+        //
+        //   1. PIT_STATUS_GUARD: lê pit_status (0=na pista, 1=entrando boxes,
+        //      2=na pit lane). Se != 0 quando volta dispara, REJEITA.
+        //
+        //   2. TRACE_SPEED_GUARD: analisa o trace_buffer da volta. Se 90%+
+        //      dos pontos têm speed < 5 km/h, o jogador NÃO dirigiu — volta
+        //      é fake (do espectado). REJEITA.
+        // ============================================================
+        private const bool FIX_PIT_STATUS_GUARD     = true;  // v2.5.5: rejeita volta se player nos boxes
+        private const bool FIX_TRACE_SPEED_GUARD    = true;  // v2.5.5: rejeita volta se trace mostra carro parado
+        private const double TRACE_LOW_SPEED_KMH    = 5.0;   // limiar de "carro parado"
+        private const double TRACE_LOW_SPEED_RATIO  = 0.90;  // 90%+ pontos parados = volta fake
 
         private string _apiToken;
         private string _endpoint;
@@ -450,8 +468,10 @@ namespace SimSetups
                 }
 
                 // === v2.5.4 — captura do setup do player ===
-                // Tenta capturar o setup uma vez por sessão. Se falhar (ex: packet
-                // ainda não chegou), tenta de novo no próximo DataUpdate até conseguir.
+                // (Funcionalidade arquivada: a captura via reflection não funcionou e
+                // o UDP listener próprio depende de configuração específica do usuário.
+                // Mantemos o stub — por enquanto _capturedSetup fica sempre null e o
+                // bloco de envio de setup nem é executado.)
                 if (CAPTURE_SETUP && _sessionActive && _capturedSetup == null)
                 {
                     _capturedSetup = CapturePlayerSetup(data);
@@ -592,14 +612,20 @@ namespace SimSetups
                     //   - Trigger normal OU fallback dispara
                     //   - Sem a verificacao de spectator, volta era enviada
                     // ============================================================
-                    if (FIX_SPECTATOR_DETECT && DetectSpectatorMode(data))
+                    bool isSpectator = FIX_SPECTATOR_DETECT && DetectSpectatorMode(data);
+                    bool isInPits = FIX_PIT_STATUS_GUARD && DetectInPits(data);
+
+                    if (isSpectator || isInPits)
                     {
+                        string reason = isSpectator
+                            ? (isInPits ? "spectator_mode_detected,in_pits" : "spectator_mode_detected")
+                            : "in_pits";
                         // Throttle de log: só loga uma vez por par (lap, lastLapTime)
-                        string spectatorKey = "SPEC:" + targetLapNumber + ":" + newData.LastLapTime.TotalSeconds.ToString("F3");
-                        if (_lastRejectedKey != spectatorKey)
+                        string rejKey = "SPEC:" + targetLapNumber + ":" + newData.LastLapTime.TotalSeconds.ToString("F3");
+                        if (_lastRejectedKey != rejKey)
                         {
-                            Log("LAP REJECTED #" + targetLapNumber + " lastLapTime=" + newData.LastLapTime.TotalSeconds.ToString("F3") + " reasons=[spectator_mode_detected] fallback=" + fallbackTrigger);
-                            _lastRejectedKey = spectatorKey;
+                            Log("LAP REJECTED #" + targetLapNumber + " lastLapTime=" + newData.LastLapTime.TotalSeconds.ToString("F3") + " reasons=[" + reason + "] fallback=" + fallbackTrigger);
+                            _lastRejectedKey = rejKey;
                         }
                         // Marca como "vista" pra nao ficar tentando: simula que ja foi enviada
                         // mas atualiza tambem _lastSentLapTime pra o fallback proximo nao re-disparar
@@ -967,6 +993,100 @@ namespace SimSetups
         // Retorna true se confirmar espectador. Em caso de dúvida (não conseguiu
         // determinar), retorna false (não bloqueia volta legítima).
         // ============================================================
+        // ============================================================
+        // v2.5.5 — Detecta se o jogador está nos boxes / pit lane
+        //
+        // O F1 25 expõe pit_status no PacketLapData:
+        //   0 = on track (correndo)
+        //   1 = pitting (entrando)
+        //   2 = in pit area (parado nos boxes)
+        //
+        // Se != 0 no momento que uma "volta nova" dispara, é IMPOSSÍVEL
+        // que seja volta legítima (o jogador está nos boxes) — REJEITA.
+        //
+        // Esta defesa é INDEPENDENTE de DetectSpectatorMode (que tenta
+        // outros campos). Aqui usamos pit_status que é mais comum em
+        // readers do F1 25 — o SimHub provavelmente expõe.
+        // ============================================================
+        private bool DetectInPits(GameData data)
+        {
+            try
+            {
+                if (data == null || data.NewData == null) return false;
+
+                // Tentativa 1: campo direto IsInPit/InPit no GameData/NewData
+                object v1 = GetMember(data.NewData, "IsInPit") ?? GetMember(data.NewData, "InPit") ?? GetMember(data.NewData, "IsInPitLane");
+                if (v1 is bool b && b) return true;
+
+                // Tentativa 2: PitStatus / PitStop como número
+                double? pitStatus = null;
+                object v2 = GetMember(data.NewData, "PitStatus") ?? GetMember(data.NewData, "Pitting") ?? GetMember(data.NewData, "PitStop");
+                if (v2 != null)
+                {
+                    if (v2 is bool bb && bb) return true;
+                    if (v2 is int i) pitStatus = (double)i;
+                    else if (v2 is byte by) pitStatus = (double)by;
+                    else if (v2 is double dd) pitStatus = dd;
+                    else if (v2 is float ff) pitStatus = (double)ff;
+                }
+
+                // Tentativa 3: ler do GameRawData
+                if (pitStatus == null)
+                {
+                    object raw = GetMember(data.NewData, "GameRawData");
+                    if (raw == null) raw = GetMember(data, "GameRawData");
+                    if (raw != null)
+                    {
+                        pitStatus = FindNumeric(raw, "pitStatus", "m_pitStatus", "PitStatus");
+                    }
+                }
+
+                // pit_status: 0=na pista, 1=entrando, 2=na pit lane.
+                // Qualquer valor != 0 significa nos boxes
+                if (pitStatus.HasValue && pitStatus.Value > 0.5) return true;
+
+                return false;
+            }
+            catch { return false; }
+        }
+
+        // ============================================================
+        // v2.5.5 — Analisa o trace_buffer pra detectar "volta fantasma"
+        //
+        // Se uma volta foi tecnicamente "registrada" pelo plugin mas o
+        // _traceBuffer mostra que o carro nunca andou (90%+ dos pontos
+        // com speed < 5 km/h), a volta é falsa — alguém ESPECTADO cruzou
+        // a linha enquanto o jogador estava parado.
+        //
+        // Cada ponto do trace contém "s" (velocidade em km/h).
+        // Se a maioria dos pontos é zero/baixíssima, NÃO houve dirigida.
+        // ============================================================
+        private bool TraceShowsCarStopped()
+        {
+            try
+            {
+                if (_traceBuffer == null || _traceBuffer.Count < 10) return false;
+
+                int totalPoints = _traceBuffer.Count;
+                int lowSpeedPoints = 0;
+                foreach (var pt in _traceBuffer)
+                {
+                    object sObj;
+                    if (!pt.TryGetValue("s", out sObj)) continue;
+                    double s = 0.0;
+                    if (sObj is double d) s = d;
+                    else if (sObj is float f) s = f;
+                    else if (sObj is int i) s = i;
+                    else if (sObj is long l) s = l;
+                    if (s < TRACE_LOW_SPEED_KMH) lowSpeedPoints++;
+                }
+
+                double ratio = (double)lowSpeedPoints / totalPoints;
+                return ratio >= TRACE_LOW_SPEED_RATIO;
+            }
+            catch { return false; }
+        }
+
         private bool DetectSpectatorMode(GameData data)
         {
             try
@@ -1205,6 +1325,17 @@ namespace SimSetups
                 // === v2.5.0 ANTI-SPECTATOR VALIDATION (endurecida) ===
                 bool isValid = true;
                 List<string> rejectReasons = new List<string>();
+
+                // === v2.5.5 FIX_TRACE_SPEED_GUARD ===
+                // Se o trace_buffer mostra que o carro nunca andou (90%+ pontos
+                // com speed < 5 km/h), volta é fake — espectador parado.
+                // Esta camada não depende de nenhuma reflection, é matematicamente
+                // determinística baseada no que o plugin SAMPLEOU durante a volta.
+                if (FIX_TRACE_SPEED_GUARD && TraceShowsCarStopped())
+                {
+                    isValid = false;
+                    rejectReasons.Add("trace_car_stopped(" + _traceBuffer.Count + "_pts)");
+                }
 
                 // === v2.5.0 FIX 2a — detectar se eh sessao online ===
                 bool isOnline = DetectOnlineSession(data);
@@ -1461,4 +1592,5 @@ namespace SimSetups
             catch { }
         }
     }
+
 }
